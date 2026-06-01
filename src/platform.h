@@ -72,7 +72,9 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-/* ========== 超时常量 ========== */
+/* ========== DNS 协议常量 ========== */
+#define DNS_PORT            53      /* DNS 服务器端口 */
+#define MAX_DNS_PACKET      512     /* DNS 报文最大长度 (RFC 1035) */
 #define DNS_DEFAULT_TIMEOUT_MS  3000   /* 等待外部 DNS 响应的超时时间 (ms) */
 #define DNS_MAX_PENDING         1024   /* 最大并发挂起查询数 */
 
