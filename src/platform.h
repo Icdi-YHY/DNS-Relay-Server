@@ -21,7 +21,10 @@
     #include <winsock2.h>
     #include <windows.h>
     #include <ws2tcpip.h>
-    #pragma comment(lib, "ws2_32.lib")
+    /* Windows: 链接时自动引用 ws2_32.lib */
+    #ifdef _MSC_VER
+        #pragma comment(lib, "ws2_32.lib")
+    #endif
 
     /* Windows 下 socket 初始化/清理 */
     static inline int socket_init(void) {
