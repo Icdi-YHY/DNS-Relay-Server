@@ -51,6 +51,11 @@ int main(int argc, char *argv[]) {
     config_t cfg;
     int ret;
 
+    /* 设置控制台 UTF-8 输出 (Windows) */
+#ifdef PLATFORM_WIN
+    SetConsoleOutputCP(CP_UTF8);
+#endif
+
     /* 1. 初始化 socket 库 (仅 Windows 需要) */
     if (socket_init() != 0) {
         fprintf(stderr, "Socket 初始化失败\n");
