@@ -111,7 +111,7 @@ ipconfig /flushdns           # 清空 DNS 缓存
 | Phase 1: 项目骨架 + DNS 协议定义 | ✅ 已完成 |
 | Phase 2: 对照表 + 本地 DNS 解析 | ✅ 已完成 |
 | Phase 3: DNS 中继 + ID 映射 + 并发 | ✅ 已完成 |
-| Phase 4: 动态缓存 + 功能扩展 | ⏳ 待开始 |
+| Phase 4: 动态缓存 + 功能扩展 | ✅ 已完成 |
 | Phase 5: 文档完善 + 最终测试 | ⏳ 待开始 |
 
 ## 参考资料

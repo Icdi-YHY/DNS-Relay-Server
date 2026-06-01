@@ -256,3 +256,73 @@ int dns_restore_id(uint8_t *response, size_t response_len,
     hdr->id = htons(original_id);
     return 0;
 }
+
+int dns_extract_a_record(const uint8_t *response, size_t resp_len,
+                          char *domain, size_t domain_len,
+                          uint32_t *ip_addr, uint32_t *ttl) {
+    if (!response || resp_len < sizeof(dns_header_t))
+        return -1;
+
+    const dns_header_t *hdr = (const dns_header_t *)response;
+
+    /* 必须是响应报文且无错误 */
+    if (DNS_GET_QR(hdr) != 1)
+        return -1;
+
+    if (DNS_GET_RCODE(hdr) != DNS_RCODE_NOERROR)
+        return 0;  /* 有错误，无 A 记录可提取 */
+
+    uint16_t qdcount = ntohs(hdr->qdcount);
+    uint16_t ancount = ntohs(hdr->ancount);
+
+    if (qdcount == 0 || ancount == 0)
+        return 0;
+
+    const uint8_t *p = response + sizeof(dns_header_t);
+    const uint8_t *end = response + resp_len;
+
+    /* 跳过 Question 段 */
+    for (uint16_t i = 0; i < qdcount; i++) {
+        p = dns_skip_name(p, end);
+        if (!p || p + 4 > end)
+            return -1;
+        p += 4;  /* 跳过 QTYPE (2) + QCLASS (2) */
+    }
+
+    /* 解析第一个 Answer */
+    if (p >= end)
+        return -1;
+
+    /* Answer NAME (可能用压缩指针) */
+    const uint8_t *name_start = p;
+    p = dns_skip_name(p, end);
+    if (!p || p + sizeof(dns_rr_t) > end)
+        return -1;
+
+    /* 如有需要，提取域名 */
+    if (domain && domain_len > 0) {
+        dns_decode_name(domain, domain_len, name_start, response, resp_len);
+    }
+
+    const dns_rr_t *rr = (const dns_rr_t *)p;
+    uint16_t type = ntohs(rr->type);
+    uint16_t rdlength = ntohs(rr->rdlength);
+
+    if (type != DNS_TYPE_A)
+        return 0;  /* 不是 A 记录 */
+
+    if (rdlength != 4)
+        return 0;  /* IPv4 地址必须是 4 字节 */
+
+    if (ttl)
+        *ttl = ntohl(rr->ttl);
+
+    p += sizeof(dns_rr_t);
+    if (p + 4 > end)
+        return -1;
+
+    if (ip_addr)
+        *ip_addr = *(const uint32_t *)p;
+
+    return 1;  /* 成功提取 */
+}

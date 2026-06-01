@@ -2,6 +2,7 @@
 #include "dns.h"
 #include "table.h"
 #include "relay.h"
+#include "cache.h"
 #include "debug.h"
 
 #include <stdio.h>
@@ -31,6 +32,7 @@ typedef struct {
     char    table_file[256];       /* 对照表文件路径 */
     table_t table;                 /* 域名-IP 对照表 */
     relay_ctx_t relay;             /* 中继转发模块 */
+    dns_cache_t cache;             /* 动态缓存 */
     SOCKET  server_sock;           /* 监听 socket (UDP 53) */
 } config_t;
 
@@ -80,7 +82,10 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* 5. 初始化中继模块 (创建 upstream_sock) */
+    /* 5. 初始化缓存 */
+    cache_init(&cfg.cache, 5000);
+
+    /* 6. 初始化中继模块 (创建 upstream_sock) */
     if (relay_init(&cfg.relay, cfg.server_sock,
                    cfg.upstream_ip, cfg.upstream_port) != 0) {
         DEBUG_ERROR("中继模块初始化失败");
@@ -128,8 +133,9 @@ int main(int argc, char *argv[]) {
         }
 
         if (ret == 0) {
-            /* 超时: 检查挂起查询超时 */
+            /* 超时: 检查挂起查询超时 + 缓存过期 */
             relay_check_timeouts(&cfg.relay);
+            cache_cleanup(&cfg.cache);
             continue;
         }
 
@@ -169,6 +175,7 @@ int main(int argc, char *argv[]) {
     /* 清理 */
     relay_destroy(&cfg.relay);
     socket_close(cfg.server_sock);
+    cache_destroy(&cfg.cache);
     table_destroy(&cfg.table);
     socket_cleanup();
     DEBUG_BASIC("DNS 中继服务器关闭");
@@ -285,12 +292,38 @@ static void handle_client_query(config_t *cfg, const uint8_t *query,
     DEBUG_BASIC("查询: %-30s 类型=%3u  客户端=%-15s",
                 domain, qtype, client_ip);
 
-    /* 本地表查找 */
+    /* 1. 检查缓存 (动态缓存的中继结果) */
     uint32_t ip_addr;
-    if (table_lookup(&cfg->table, domain, &ip_addr)) {
-        /* 命中本地表 */
+    if (cache_get(&cfg->cache, domain, &ip_addr)) {
+        /* 缓存命中 */
         if (ip_addr == 0) {
-            /* 0.0.0.0 → 返回 NXDOMAIN (域名不存在) */
+            /* 否定缓存: NXDOMAIN */
+            int resp_len = dns_build_response(query, query_len,
+                                              response, sizeof(response),
+                                              0, 0);
+            if (resp_len > 0) {
+                sendto(cfg->server_sock, (const char *)response, resp_len, 0,
+                       (const struct sockaddr *)client_addr, client_len);
+                DEBUG_BASIC("→ 缓存(NXDOMAIN): %s", domain);
+            }
+        } else {
+            int resp_len = dns_build_response(query, query_len,
+                                              response, sizeof(response),
+                                              ip_addr, 60);
+            if (resp_len > 0) {
+                sendto(cfg->server_sock, (const char *)response, resp_len, 0,
+                       (const struct sockaddr *)client_addr, client_len);
+                char ip_str[64];
+                inet_ntop(AF_INET, &ip_addr, ip_str, sizeof(ip_str));
+                DEBUG_BASIC("→ 缓存命中: %s -> %s", domain, ip_str);
+            }
+        }
+        return;
+    }
+
+    /* 2. 检查本地对照表 */
+    if (table_lookup(&cfg->table, domain, &ip_addr)) {
+        if (ip_addr == 0) {
             int resp_len = dns_build_response(query, query_len,
                                               response, sizeof(response),
                                               0, 0);
@@ -300,7 +333,6 @@ static void handle_client_query(config_t *cfg, const uint8_t *query,
                 DEBUG_BASIC("→ 拦截 (NXDOMAIN): %s", domain);
             }
         } else {
-            /* 返回本地 IP */
             int resp_len = dns_build_response(query, query_len,
                                               response, sizeof(response),
                                               ip_addr, 3600);
@@ -313,7 +345,7 @@ static void handle_client_query(config_t *cfg, const uint8_t *query,
             }
         }
     } else {
-        /* 未命中本地表 → 中继到上游 DNS */
+        /* 3. 未命中 → 中继到上游 DNS */
         DEBUG_VERBOSE("→ 中继: %s (ID转换中...)", domain);
         relay_forward(&cfg->relay, query, query_len,
                       client_addr, client_len);
@@ -331,8 +363,24 @@ static void handle_upstream_response(config_t *cfg,
         return;
     }
 
-    DEBUG_VERBOSE("收到上游响应 (ID=%u, %zu 字节)",
-                  ntohs(hdr->id), resp_len);
+    DEBUG_VERBOSE("收到上游响应 (ID=%u, %zu 字节, RCODE=%u)",
+                  ntohs(hdr->id), resp_len, DNS_GET_RCODE(hdr));
 
+    /* 先转发给客户端 (这样才能释放 pending 条目) */
     relay_process_response(&cfg->relay, resp, resp_len);
+
+    /* 提取 A 记录并缓存 (供后续查询加速) */
+    char cache_domain[256];
+    uint32_t cache_ip;
+    uint32_t cache_ttl;
+
+    int ret = dns_extract_a_record(resp, resp_len,
+                                    cache_domain, sizeof(cache_domain),
+                                    &cache_ip, &cache_ttl);
+    if (ret == 1) {
+        cache_put(&cfg->cache, cache_domain, cache_ip, cache_ttl);
+    } else if (ret == -1) {
+        DEBUG_VERBOSE("提取 A 记录失败");
+    }
+    /* ret == 0: 不是 A 记录，无需缓存 (可能是 CNAME/MX/AAAA) */
 }

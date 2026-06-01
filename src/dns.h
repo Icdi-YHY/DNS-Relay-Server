@@ -203,6 +203,20 @@ int dns_restore_id(uint8_t *response, size_t response_len,
 int dns_copy_header(uint8_t *dst, size_t dst_len,
                     const uint8_t *src, size_t src_len);
 
+/**
+ * dns_extract_a_record - 从 DNS 响应中提取第一个 A 记录 IP
+ * @response: DNS 响应报文
+ * @resp_len: 响应报文长度
+ * @domain: 输出，查询的域名 (可选)
+ * @domain_len: 域名缓冲区大小
+ * @ip_addr: 输出，A 记录的 IP 地址 (网络字节序)
+ * @ttl: 输出，TTL 值 (可选)
+ * @return: 成功返回 1，无 A 记录返回 0，失败返回 -1
+ */
+int dns_extract_a_record(const uint8_t *response, size_t resp_len,
+                          char *domain, size_t domain_len,
+                          uint32_t *ip_addr, uint32_t *ttl);
+
 #ifdef _MSC_VER
     #pragma pack(pop)
 #endif
