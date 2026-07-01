@@ -8,7 +8,9 @@ CFLAGS = -Wall -Wextra -std=c99 -O2
 LDFLAGS =
 
 # 源文件
-SRC = src/main.c src/dns.c src/table.c src/relay.c src/cache.c
+SRC = src/main.c src/platform.c src/debug.c src/util.c \
+      src/dns_message.c src/dns_table.c src/dns_cache.c \
+      src/id_map.c src/dns_relay.c
 OBJ = $(SRC:.c=.o)
 TARGET = dnsrelay
 

@@ -1,54 +1,58 @@
+/*
+ * main.c — DNS 中继服务器主程序
+ *
+ * 事件驱动模型 (select)，单线程处理所有客户端并发查询
+ * 单 UDP socket 架构：一个 socket 绑定 53 端口，
+ * 同时接收客户端请求和外部 DNS 响应，通过源地址区分。
+ */
+
 #include "platform.h"
-#include "dns.h"
-#include "table.h"
-#include "relay.h"
-#include "cache.h"
+#include "dns_message.h"
+#include "dns_table.h"
+#include "dns_cache.h"
+#include "dns_relay.h"
+#include "id_map.h"
 #include "debug.h"
+#include "util.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-/*
- * main.c — DNS 中继服务器主程序
- *
- * 事件驱动模型 (select)，单线程处理所有客户端并发查询
- * 同时监听两个 socket:
- *   - server_sock: 接收客户端 DNS 查询 (端口 53)
- *   - upstream_sock: 接收上游 DNS 服务器响应
- */
-
-/* ========== 全局变量 ========== */
-debug_level_t g_debug_level = DEBUG_NONE;
-
-/* 默认配置 */
+/* ========== 默认配置 ========== */
 #define DEFAULT_DNS_SERVER  "202.106.0.20"
 #define DEFAULT_TABLE_FILE  "dnsrelay.txt"
+#define DEFAULT_TABLE_SIZE  8191   /* 对照表哈希桶数 */
+#define DEFAULT_CACHE_SIZE  1021   /* 缓存哈希桶数 */
+#define DEFAULT_ID_MAP_SIZE 1024   /* 最大并发查询数 */
+#define PENDING_TIMEOUT     5      /* 超时秒数 */
 
-/* ========== 配置 ========== */
+/* ========== 全局配置 ========== */
 typedef struct {
-    char    upstream_ip[64];       /* 上游 DNS 服务器 IP */
-    uint16_t upstream_port;        /* 上游 DNS 服务器端口 (通常 53) */
-    char    table_file[256];       /* 对照表文件路径 */
-    table_t table;                 /* 域名-IP 对照表 */
-    relay_ctx_t relay;             /* 中继转发模块 */
-    dns_cache_t cache;             /* 动态缓存 */
-    SOCKET  server_sock;           /* 监听 socket (UDP 53) */
-} config_t;
+    char        dns_server[64];      /* 外部 DNS 服务器 IP */
+    int         dns_port;            /* 外部 DNS 端口 */
+    char        table_path[256];     /* 对照表路径 */
+    socket_t    sock;                /* 监听 socket（唯一） */
+    struct sockaddr_in server_addr;  /* 本机绑定地址 */
+    struct sockaddr_in dns_addr;     /* 外部 DNS 地址 */
+
+    DNSTable    table;               /* 静态对照表 */
+    DNSCache    cache;               /* 动态缓存 */
+    IDMap       id_map;              /* ID 映射表 */
+} GlobalState;
 
 /* ========== 函数声明 ========== */
-static int parse_args(config_t *cfg, int argc, char *argv[]);
-static int init_server(config_t *cfg);
-static void handle_client_query(config_t *cfg, const uint8_t *query,
-                                 size_t query_len,
-                                 const struct sockaddr_in *client_addr,
-                                 socklen_t client_len);
-static void handle_upstream_response(config_t *cfg,
-                                      const uint8_t *resp, size_t resp_len);
+static int parse_args(GlobalState *state, int argc, char *argv[]);
+static int init_server(GlobalState *state);
+static void handle_client_query(GlobalState *state,
+                                 const uint8_t *query, int qlen,
+                                 const struct sockaddr_in *client_addr);
+static void handle_upstream_response(GlobalState *state,
+                                      const uint8_t *resp, int resp_len);
 
 /* ========== 主函数 ========== */
 int main(int argc, char *argv[]) {
-    config_t cfg;
+    GlobalState state;
     int ret;
 
     /* 设置控制台 UTF-8 输出 (Windows) */
@@ -56,159 +60,161 @@ int main(int argc, char *argv[]) {
     SetConsoleOutputCP(CP_UTF8);
 #endif
 
-    /* 1. 初始化 socket 库 (仅 Windows 需要) */
+    /* 1. 初始化 socket 库 */
     if (socket_init() != 0) {
         fprintf(stderr, "Socket 初始化失败\n");
         return 1;
     }
 
     /* 2. 解析命令行参数 */
-    memset(&cfg, 0, sizeof(cfg));
-    cfg.upstream_port = 53;
-    if (parse_args(&cfg, argc, argv) != 0) {
+    memset(&state, 0, sizeof(state));
+    state.dns_port = DNS_PORT;
+    if (parse_args(&state, argc, argv) != 0) {
         fprintf(stderr, "用法: dnsrelay [-d|-dd] [dns-server-ipaddr] [filename]\n");
         socket_cleanup();
         return 1;
     }
 
     /* 3. 加载对照表 */
-    table_init(&cfg.table);
-    if (table_load_file(&cfg.table, cfg.table_file) < 0) {
-        DEBUG_ERROR("加载对照表失败: %s", cfg.table_file);
+    if (dns_table_init(&state.table, DEFAULT_TABLE_SIZE) != 0) {
+        DEBUG_ERROR("对照表初始化失败");
+        socket_cleanup();
+        return 1;
+    }
+    if (dns_table_load(&state.table, state.table_path) < 0) {
+        DEBUG_ERROR("加载对照表失败: %s", state.table_path);
+        dns_table_destroy(&state.table);
         socket_cleanup();
         return 1;
     }
 
-    /* 4. 初始化服务器 (创建 + bind server_sock) */
-    if (init_server(&cfg) != 0) {
+    /* 4. 初始化服务器 (创建 + bind) */
+    if (init_server(&state) != 0) {
         DEBUG_ERROR("服务器初始化失败");
-        table_destroy(&cfg.table);
+        dns_table_destroy(&state.table);
         socket_cleanup();
         return 1;
     }
 
     /* 5. 初始化缓存 */
-    cache_init(&cfg.cache, 5000);
-
-    /* 6. 初始化中继模块 (创建 upstream_sock) */
-    if (relay_init(&cfg.relay, cfg.server_sock,
-                   cfg.upstream_ip, cfg.upstream_port) != 0) {
-        DEBUG_ERROR("中继模块初始化失败");
-        socket_close(cfg.server_sock);
-        table_destroy(&cfg.table);
+    if (dns_cache_init(&state.cache, DEFAULT_CACHE_SIZE) != 0) {
+        DEBUG_ERROR("缓存初始化失败");
+        close_socket(state.sock);
+        dns_table_destroy(&state.table);
         socket_cleanup();
         return 1;
     }
 
-    DEBUG_BASIC("DNS 中继服务器启动");
-    DEBUG_BASIC("监听端口: %d", DNS_PORT);
-    DEBUG_BASIC("上游 DNS: %s:%d", cfg.upstream_ip, cfg.upstream_port);
-    DEBUG_BASIC("对照表: %s (%zu 条记录)", cfg.table_file, cfg.table.count);
+    /* 6. 初始化 ID 映射表 */
+    if (id_map_init(&state.id_map, DEFAULT_ID_MAP_SIZE) != 0) {
+        DEBUG_ERROR("ID 映射表初始化失败");
+        dns_cache_destroy(&state.cache);
+        close_socket(state.sock);
+        dns_table_destroy(&state.table);
+        socket_cleanup();
+        return 1;
+    }
 
-    /* 6. 事件循环 (select 多路复用) */
+    /* 7. 输出启动信息 */
+    DEBUG(1, "DNS 中继服务器启动");
+    DEBUG(1, "监听端口: %d", DNS_PORT);
+    DEBUG(1, "上游 DNS: %s:%d", state.dns_server, state.dns_port);
+    DEBUG(1, "对照表: %s (%d 条记录)", state.table_path, state.table.count);
+
+    /* ========== 事件循环 (select) ========== */
     fd_set read_fds;
     struct timeval tv;
     uint8_t buffer[MAX_DNS_PACKET];
     struct sockaddr_in from_addr;
     socklen_t from_len;
-    SOCKET upstream_sock = relay_get_upstream_sock(&cfg.relay);
-    int max_fd = (int)(cfg.server_sock > upstream_sock
-                       ? cfg.server_sock : upstream_sock) + 1;
 
     while (1) {
         FD_ZERO(&read_fds);
-        FD_SET(cfg.server_sock, &read_fds);
-        FD_SET(upstream_sock, &read_fds);
+        FD_SET(state.sock, &read_fds);
 
-        /* 设置 select 超时 (1秒，用于定期检查挂起查询超时) */
+        /* select 超时 1 秒，用于定期检查超时 */
         tv.tv_sec = 1;
         tv.tv_usec = 0;
 
-        ret = select(max_fd, &read_fds, NULL, NULL, &tv);
+        ret = select((int)(state.sock + 1), &read_fds, NULL, NULL, &tv);
         if (ret < 0) {
 #ifdef PLATFORM_WIN
-            if (socket_errno() == WSAEINTR)
-                continue;
+            if (socket_errno() == WSAEINTR) continue;
 #else
-            if (errno == EINTR)
-                continue;
+            if (errno == EINTR) continue;
 #endif
             DEBUG_ERROR("select() 失败: errno=%d", socket_errno());
             break;
         }
 
         if (ret == 0) {
-            /* 超时: 检查挂起查询超时 + 缓存过期 */
-            relay_check_timeouts(&cfg.relay);
-            cache_cleanup(&cfg.cache);
+            /* 超时: 清理过期缓存和 ID 映射 */
+            id_map_cleanup(&state.id_map, PENDING_TIMEOUT);
+            dns_cache_evict_expired(&state.cache);
             continue;
         }
 
-        /* --- 来自客户端的 DNS 查询 (端口 53) --- */
-        if (FD_ISSET(cfg.server_sock, &read_fds)) {
+        /* --- 收到数据 --- */
+        if (FD_ISSET(state.sock, &read_fds)) {
             from_len = sizeof(from_addr);
-            int n = recvfrom(cfg.server_sock, (char *)buffer, sizeof(buffer), 0,
+            int n = recvfrom(state.sock, (char *)buffer, sizeof(buffer), 0,
                              (struct sockaddr *)&from_addr, &from_len);
             if (n < 0) {
-                DEBUG_ERROR("recvfrom(server_sock) 失败: errno=%d", socket_errno());
+                DEBUG(2, "recvfrom 失败: errno=%d", socket_errno());
                 continue;
             }
 
-            if ((size_t)n < sizeof(dns_header_t))
+            if (n < (int)sizeof(DNSHeader))
                 continue;
 
-            handle_client_query(&cfg, buffer, (size_t)n, &from_addr, from_len);
-        }
-
-        /* --- 来自上游 DNS 的响应 --- */
-        if (FD_ISSET(upstream_sock, &read_fds)) {
-            from_len = sizeof(from_addr);
-            int n = recvfrom(upstream_sock, (char *)buffer, sizeof(buffer), 0,
-                             (struct sockaddr *)&from_addr, &from_len);
-            if (n < 0) {
-                DEBUG_ERROR("recvfrom(upstream_sock) 失败: errno=%d", socket_errno());
-                continue;
+            /*
+             * 通过源地址区分：
+             *   - 源地址 == 上游 DNS 地址 → 上游响应
+             *   - 否则 → 客户端查询
+             */
+            if (from_addr.sin_addr.s_addr == state.dns_addr.sin_addr.s_addr &&
+                from_addr.sin_port == state.dns_addr.sin_port) {
+                /* 来自上游 DNS 的响应 */
+                handle_upstream_response(&state, buffer, n);
+            } else {
+                /* 来自客户端的 DNS 查询 */
+                handle_client_query(&state, buffer, n, &from_addr);
             }
-
-            if ((size_t)n < sizeof(dns_header_t))
-                continue;
-
-            handle_upstream_response(&cfg, buffer, (size_t)n);
         }
     }
 
     /* 清理 */
-    relay_destroy(&cfg.relay);
-    socket_close(cfg.server_sock);
-    cache_destroy(&cfg.cache);
-    table_destroy(&cfg.table);
+    id_map_destroy(&state.id_map);
+    dns_cache_destroy(&state.cache);
+    close_socket(state.sock);
+    dns_table_destroy(&state.table);
     socket_cleanup();
-    DEBUG_BASIC("DNS 中继服务器关闭");
+    DEBUG(1, "DNS 中继服务器关闭");
     return 0;
 }
 
 /* ========== 参数解析 ========== */
-static int parse_args(config_t *cfg, int argc, char *argv[]) {
+static int parse_args(GlobalState *state, int argc, char *argv[]) {
     int i = 1;
 
     /* 默认值 */
-    strcpy(cfg->upstream_ip, DEFAULT_DNS_SERVER);
-    strcpy(cfg->table_file, DEFAULT_TABLE_FILE);
+    strcpy(state->dns_server, DEFAULT_DNS_SERVER);
+    strcpy(state->table_path, DEFAULT_TABLE_FILE);
 
     while (i < argc) {
         if (strcmp(argv[i], "-d") == 0) {
-            g_debug_level = DEBUG_BASIC;
+            g_debug_level = DEBUG_LEVEL_BASIC;
             i++;
         } else if (strcmp(argv[i], "-dd") == 0) {
-            g_debug_level = DEBUG_VERBOSE;
+            g_debug_level = DEBUG_LEVEL_VERBOSE;
             i++;
         } else if (argv[i][0] == '-') {
             fprintf(stderr, "未知选项: %s\n", argv[i]);
             return -1;
         } else {
             /* 第一个非选项参数是 DNS 服务器地址 */
-            if (strlen(argv[i]) < sizeof(cfg->upstream_ip)) {
-                strcpy(cfg->upstream_ip, argv[i]);
+            if (strlen(argv[i]) < sizeof(state->dns_server)) {
+                strcpy(state->dns_server, argv[i]);
                 i++;
             } else {
                 return -1;
@@ -216,8 +222,8 @@ static int parse_args(config_t *cfg, int argc, char *argv[]) {
 
             /* 第二个非选项参数是对照表文件 */
             if (i < argc && argv[i][0] != '-') {
-                if (strlen(argv[i]) < sizeof(cfg->table_file)) {
-                    strcpy(cfg->table_file, argv[i]);
+                if (strlen(argv[i]) < sizeof(state->table_path)) {
+                    strcpy(state->table_path, argv[i]);
                     i++;
                 } else {
                     return -1;
@@ -230,10 +236,10 @@ static int parse_args(config_t *cfg, int argc, char *argv[]) {
 }
 
 /* ========== 服务器初始化 ========== */
-static int init_server(config_t *cfg) {
+static int init_server(GlobalState *state) {
     /* 创建 UDP socket */
-    cfg->server_sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (cfg->server_sock == INVALID_SOCKET) {
+    state->sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (state->sock == INVALID_SOCKET) {
         DEBUG_ERROR("socket() 创建失败");
         return -1;
     }
@@ -241,13 +247,13 @@ static int init_server(config_t *cfg) {
     /* 设置非阻塞模式 */
 #ifdef PLATFORM_WIN
     unsigned long nonblock = 1;
-    if (ioctlsocket(cfg->server_sock, FIONBIO, &nonblock) != 0) {
+    if (ioctlsocket(state->sock, FIONBIO, &nonblock) != 0) {
         DEBUG_ERROR("ioctlsocket() 失败");
         return -1;
     }
 #else
-    int flags = fcntl(cfg->server_sock, F_GETFL, 0);
-    if (flags < 0 || fcntl(cfg->server_sock, F_SETFL, flags | O_NONBLOCK) < 0) {
+    int flags = fcntl(state->sock, F_GETFL, 0);
+    if (flags < 0 || fcntl(state->sock, F_SETFL, flags | O_NONBLOCK) < 0) {
         DEBUG_ERROR("fcntl() 失败");
         return -1;
     }
@@ -255,137 +261,163 @@ static int init_server(config_t *cfg) {
 
     /* 允许地址重用 */
     int reuse = 1;
-    setsockopt(cfg->server_sock, SOL_SOCKET, SO_REUSEADDR,
+    setsockopt(state->sock, SOL_SOCKET, SO_REUSEADDR,
                (const char *)&reuse, sizeof(reuse));
 
     /* 绑定端口 53 */
-    struct sockaddr_in server_addr;
-    memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons(DNS_PORT);
+    memset(&state->server_addr, 0, sizeof(state->server_addr));
+    state->server_addr.sin_family = AF_INET;
+    state->server_addr.sin_addr.s_addr = INADDR_ANY;
+    state->server_addr.sin_port = htons(DNS_PORT);
 
-    if (bind(cfg->server_sock, (struct sockaddr *)&server_addr,
-             sizeof(server_addr)) < 0) {
+    if (bind(state->sock, (struct sockaddr *)&state->server_addr,
+             sizeof(state->server_addr)) < 0) {
         DEBUG_ERROR("bind() 失败 (端口 %d 可能被占用)", DNS_PORT);
-        socket_close(cfg->server_sock);
-        cfg->server_sock = INVALID_SOCKET;
+        close_socket(state->sock);
+        state->sock = INVALID_SOCKET;
         return -1;
     }
+
+    /* 构造上游 DNS 地址 */
+    memset(&state->dns_addr, 0, sizeof(state->dns_addr));
+    state->dns_addr.sin_family = AF_INET;
+    state->dns_addr.sin_port = htons((uint16_t)state->dns_port);
+
+    struct in_addr addr;
+    if (inet_pton(AF_INET, state->dns_server, &addr) != 1) {
+        DEBUG_ERROR("无效的上游 DNS 地址: %s", state->dns_server);
+        close_socket(state->sock);
+        state->sock = INVALID_SOCKET;
+        return -1;
+    }
+    state->dns_addr.sin_addr = addr;
 
     return 0;
 }
 
 /* ========== 客户端查询处理 ========== */
-static void handle_client_query(config_t *cfg, const uint8_t *query,
-                                 size_t query_len,
-                                 const struct sockaddr_in *client_addr,
-                                 socklen_t client_len) {
-    char domain[256];
-    uint16_t qtype;
+static void handle_client_query(GlobalState *state,
+                                 const uint8_t *query, int qlen,
+                                 const struct sockaddr_in *client_addr) {
+    DNSHeader hdr;
+    DNSQuestion q;
     uint8_t response[MAX_DNS_PACKET];
-
-    /* 提取查询域名 */
-    if (dns_extract_question(query, query_len, domain, sizeof(domain), &qtype) < 0) {
-        DEBUG_VERBOSE("无法解析 DNS 查询报文 (长度=%zu)", query_len);
-        return;
-    }
-
-    /* 显示客户端信息 */
     char client_ip[64];
-    inet_ntop(AF_INET, &client_addr->sin_addr, client_ip, sizeof(client_ip));
-    DEBUG_BASIC("查询: %-30s 类型=%3u  客户端=%-15s",
-                domain, qtype, client_ip);
 
-    /* 1. 检查缓存 (动态缓存的中继结果) */
-    uint32_t ip_addr;
-    if (cache_get(&cfg->cache, domain, &ip_addr)) {
-        /* 缓存命中 */
-        if (ip_addr == 0) {
-            /* 否定缓存: NXDOMAIN */
-            int resp_len = dns_build_response(query, query_len,
-                                              response, sizeof(response),
-                                              0, 0);
-            if (resp_len > 0) {
-                sendto(cfg->server_sock, (const char *)response, resp_len, 0,
-                       (const struct sockaddr *)client_addr, client_len);
-                DEBUG_BASIC("→ 缓存(NXDOMAIN): %s", domain);
-            }
-        } else {
-            int resp_len = dns_build_response(query, query_len,
-                                              response, sizeof(response),
-                                              ip_addr, 60);
-            if (resp_len > 0) {
-                sendto(cfg->server_sock, (const char *)response, resp_len, 0,
-                       (const struct sockaddr *)client_addr, client_len);
-                char ip_str[64];
-                inet_ntop(AF_INET, &ip_addr, ip_str, sizeof(ip_str));
-                DEBUG_BASIC("→ 缓存命中: %s -> %s", domain, ip_str);
-            }
+    g_query_seq++;  /* 递增查询序号 */
+
+    /* 解析查询报文 */
+    if (dns_decode_query(query, qlen, &hdr, &q) != 0) {
+        DEBUG(2, "无法解析 DNS 查询报文 (长度=%d)", qlen);
+        return;
+    }
+
+    /* 获取客户端 IP 字符串 */
+    inet_ntop(AF_INET, &client_addr->sin_addr, client_ip, sizeof(client_ip));
+    DEBUG(1, "查询: %-30s 类型=%3u  客户端=%-15s", q.qname, q.qtype, client_ip);
+
+    /* 1. 检查缓存（动态缓存的中继结果，存完整响应报文） */
+    CacheEntry *ce = dns_cache_get(&state->cache, q.qname);
+    if (ce) {
+        /* 缓存命中，复制响应并更新 ID 以匹配当前查询 */
+        uint8_t cached_resp[MAX_DNS_PACKET];
+        int copy_len = ce->response_len < (int)sizeof(cached_resp)
+                       ? ce->response_len : (int)sizeof(cached_resp);
+        memcpy(cached_resp, ce->response, (size_t)copy_len);
+        dns_restore_id(cached_resp, (size_t)copy_len, ntohs(hdr.id));
+        sendto(state->sock, (const char *)cached_resp, copy_len, 0,
+               (const struct sockaddr *)client_addr, sizeof(*client_addr));
+        DEBUG(1, "→ 缓存命中: %s", q.qname);
+        return;
+    }
+
+    /* 2. 检查本地对照表（支持一域名多 IP） */
+    uint32_t ips[16];
+    int ip_count = dns_table_lookup_all(&state->table, q.qname, ips, 16);
+    if (ip_count == -1) {
+        /* 不良网站拦截 (0.0.0.0 → NXDOMAIN) */
+        int resp_len = dns_build_response_multi(&hdr, &q, NULL, 0, 1, response);
+        if (resp_len > 0) {
+            sendto(state->sock, (const char *)response, resp_len, 0,
+                   (const struct sockaddr *)client_addr, sizeof(*client_addr));
+            DEBUG(1, "→ 拦截 (NXDOMAIN): %s", q.qname);
+        }
+        return;
+    }
+    if (ip_count > 0) {
+        /* 本地解析（可能多个 IP） */
+        int resp_len = dns_build_response_multi(&hdr, &q, ips, ip_count, 0, response);
+        if (resp_len > 0) {
+            sendto(state->sock, (const char *)response, resp_len, 0,
+                   (const struct sockaddr *)client_addr, sizeof(*client_addr));
+            char ip_str[64];
+            ip_int_to_str(ips[0], ip_str);
+            DEBUG(1, "→ 本地解析: %s -> %s (共%d个IP)",
+                  q.qname, ip_str, ip_count);
         }
         return;
     }
 
-    /* 2. 检查本地对照表 */
-    if (table_lookup(&cfg->table, domain, &ip_addr)) {
-        if (ip_addr == 0) {
-            int resp_len = dns_build_response(query, query_len,
-                                              response, sizeof(response),
-                                              0, 0);
-            if (resp_len > 0) {
-                sendto(cfg->server_sock, (const char *)response, resp_len, 0,
-                       (const struct sockaddr *)client_addr, client_len);
-                DEBUG_BASIC("→ 拦截 (NXDOMAIN): %s", domain);
-            }
-        } else {
-            int resp_len = dns_build_response(query, query_len,
-                                              response, sizeof(response),
-                                              ip_addr, 3600);
-            if (resp_len > 0) {
-                sendto(cfg->server_sock, (const char *)response, resp_len, 0,
-                       (const struct sockaddr *)client_addr, client_len);
-                char ip_str[64];
-                inet_ntop(AF_INET, &ip_addr, ip_str, sizeof(ip_str));
-                DEBUG_BASIC("→ 本地解析: %s -> %s", domain, ip_str);
-            }
-        }
-    } else {
-        /* 3. 未命中 → 中继到上游 DNS */
-        DEBUG_VERBOSE("→ 中继: %s (ID转换中...)", domain);
-        relay_forward(&cfg->relay, query, query_len,
-                      client_addr, client_len);
-    }
+    /* 3. 未命中 → 中继到上游 DNS */
+    DEBUG(1, "→ 中继: %s (ID转换中...)", q.qname);
+    relay_forward(state->sock, &state->dns_addr,
+                  query, qlen,
+                  (struct sockaddr_in *)client_addr, &state->id_map);
 }
 
 /* ========== 上游响应处理 ========== */
-static void handle_upstream_response(config_t *cfg,
-                                      const uint8_t *resp, size_t resp_len) {
-    const dns_header_t *hdr = (const dns_header_t *)resp;
+static void handle_upstream_response(GlobalState *state,
+                                      const uint8_t *resp, int resp_len) {
+    const DNSHeader *hdr = (const DNSHeader *)resp;
 
     /* 只处理响应报文 */
     if (DNS_GET_QR(hdr) != 1) {
-        DEBUG_VERBOSE("忽略上游非响应报文");
+        DEBUG(2, "忽略上游非响应报文");
         return;
     }
 
-    DEBUG_VERBOSE("收到上游响应 (ID=%u, %zu 字节, RCODE=%u)",
-                  ntohs(hdr->id), resp_len, DNS_GET_RCODE(hdr));
+    DEBUG(2, "收到上游响应 (ID=%u, %d 字节, RCODE=%u)",
+          ntohs(hdr->id), resp_len, DNS_GET_RCODE(hdr));
 
-    /* 先转发给客户端 (这样才能释放 pending 条目) */
-    relay_process_response(&cfg->relay, resp, resp_len);
+    /* 查 ID 映射表，找到原始客户端 */
+    uint16_t relay_id = ntohs(hdr->id);
+    uint16_t orig_id;
+    struct sockaddr_in client_addr;
 
-    /* 提取 A 记录并缓存 (供后续查询加速) */
-    char cache_domain[256];
-    uint32_t cache_ip;
-    uint32_t cache_ttl;
-
-    int ret = dns_extract_a_record(resp, resp_len,
-                                    cache_domain, sizeof(cache_domain),
-                                    &cache_ip, &cache_ttl);
-    if (ret == 1) {
-        cache_put(&cfg->cache, cache_domain, cache_ip, cache_ttl);
-    } else if (ret == -1) {
-        DEBUG_VERBOSE("提取 A 记录失败");
+    if (id_map_lookup(&state->id_map, relay_id, &orig_id, &client_addr) != 0) {
+        DEBUG(2, "收到未知 relay_id=%u 的响应 (可能已超时)", relay_id);
+        return;
     }
-    /* ret == 0: 不是 A 记录，无需缓存 (可能是 CNAME/MX/AAAA) */
+
+    /* 复制响应报文并恢复原始 ID */
+    uint8_t relay_resp[MAX_DNS_PACKET];
+    int copy_len = resp_len < (int)sizeof(relay_resp) ? resp_len : (int)sizeof(relay_resp);
+    memcpy(relay_resp, resp, (size_t)copy_len);
+    dns_restore_id(relay_resp, (size_t)copy_len, orig_id);
+
+    /* 发送给客户端 */
+    sendto(state->sock, (const char *)relay_resp, copy_len, 0,
+           (const struct sockaddr *)&client_addr, sizeof(client_addr));
+
+    /* 释放 ID 映射条目 */
+    id_map_free(&state->id_map, relay_id);
+
+    /* 提取域名用于日志 */
+    {
+        DNSHeader tmp_hdr;
+        DNSQuestion tmp_q;
+        if (dns_decode_query(resp, resp_len, &tmp_hdr, &tmp_q) == 0) {
+            DEBUG(1, "中继响应: %-30s  ID=%u→%u  客户端=%s:%d",
+                   tmp_q.qname,
+                   relay_id, orig_id,
+                   inet_ntoa(client_addr.sin_addr),
+                   ntohs(client_addr.sin_port));
+
+            /* 缓存响应报文供后续使用 */
+            if (DNS_GET_RCODE(hdr) == DNS_RCODE_NOERROR) {
+                dns_cache_put(&state->cache, tmp_q.qname,
+                              relay_resp, copy_len, 60);
+            }
+        }
+    }
 }

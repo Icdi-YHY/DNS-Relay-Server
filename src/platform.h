@@ -26,17 +26,12 @@
         #pragma comment(lib, "ws2_32.lib")
     #endif
 
-    /* Windows 下 socket 初始化/清理 */
-    static inline int socket_init(void) {
-        WSADATA wsa;
-        return WSAStartup(MAKEWORD(2, 2), &wsa);
-    }
-    static inline void socket_cleanup(void) {
-        WSACleanup();
-    }
+    /* Windows 下 socket 初始化/清理 (声明在 platform.c) */
+    int socket_init(void);
+    void socket_cleanup(void);
 
     /* Windows 下 close 用 closesocket */
-    #define socket_close(s)  closesocket(s)
+    #define close_socket(s)  closesocket(s)
     #define socket_errno()   WSAGetLastError()
     #define SOCKET_EWOULDBLOCK WSAEWOULDBLOCK
     #define SOCKET_ETIMEDOUT   WSAETIMEDOUT
@@ -52,11 +47,11 @@
     #include <sys/select.h>
     #include <sys/time.h>
 
-    /* POSIX 下 socket 初始化为空操作 */
-    static inline int socket_init(void)  { return 0; }
-    static inline void socket_cleanup(void) {}
+    /* POSIX 下 socket 初始化为空操作 (声明在 platform.c) */
+    int socket_init(void);
+    void socket_cleanup(void);
 
-    #define socket_close(s)  close(s)
+    #define close_socket(s)  close(s)
     #define socket_errno()   errno
     #define SOCKET_EWOULDBLOCK EWOULDBLOCK
     #define SOCKET_ETIMEDOUT   ETIMEDOUT
@@ -71,6 +66,9 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+
+/* socket 类型抽象 */
+typedef SOCKET socket_t;
 
 /* ========== DNS 协议常量 ========== */
 #define DNS_PORT            53      /* DNS 服务器端口 */

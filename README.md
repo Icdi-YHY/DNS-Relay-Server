@@ -103,32 +103,32 @@ DNS 中继服务器是位于客户端与外部 DNS 服务器之间的中间层�
 ```
 dnsrelay/
 ├── src/
-│   ├── main.c         入口、参数解析、UDP 事件循环
-│   ├── dns.h          DNS 协议结构体及编解码函数声明 (RFC 1035 §4.1)
-│   ├── dns.c          DNS 报文解析/构建实现
-│   ├── table.h        域名-IP 对照表接口
-│   ├── table.c        哈希表实现，支持文件加载与 O(1) 查找
-│   ├── relay.h        中继转发模块接口
-│   ├── relay.c        外部 DNS 通信 + ID 映射 + 超时管理
-│   ├── cache.h        动态缓存接口
-│   ├── cache.c        TTL 过期自动清理的哈希表缓存
-│   ├── platform.h     平台抽象层 (Windows/Linux socket 封装)
-│   └── debug.h        调试输出宏 (级别 0/1/2)
-├── dnsrelay.txt       默认域名-IP 对照表 (909 条记录)
-├── Makefile           构建系统 (支持 GCC/MinGW)
-└── README.md          本文件
+│   ├── main.c             入口、参数解析、UDP 事件循环
+│   ├── platform.h/c       平台抽象层 (Windows/Linux socket 封装)
+│   ├── debug.h/c          调试输出 (级别 0/1/2, 带递增序号)
+│   ├── util.h/c           工具函数 (域名编解码/IP 转换)
+│   ├── dns_message.h/c    DNS 协议结构体及报文编解码 (RFC 1035 §4.1)
+│   ├── dns_table.h/c      域名-IP 对照表 (哈希表, 支持文件加载与 O(1) 查找)
+│   ├── dns_cache.h/c      动态缓存 (完整响应报文, TTL 过期自动清理)
+│   ├── id_map.h/c         ID 转换表 (管理并发查询的 ID 映射)
+│   └── dns_relay.h/c      中继转发 (转发到外部 DNS, 依赖 id_map 模块)
+├── dnsrelay.txt           默认域名-IP 对照表 (909 条记录)
+├── Makefile               构建系统 (支持 GCC/MinGW)
+└── README.md              本文件
 ```
 
 ### 模块职责与耦合
 
 | 模块 | 职责 | 依赖 | 抽象程度 |
 |------|------|------|---------|
-| `platform.h` | Socket 初始化/清理/关闭 | 无 | ⭐⭐⭐ |
-| `debug.h` | 分级调试输出宏 | `platform.h` (time) | ⭐⭐⭐ |
-| `dns.h/c` | DNS 报文编解码 | `platform.h` | ⭐⭐⭐ |
-| `table.h/c` | 域名-IP 哈希表 | `platform.h` | ⭐⭐⭐ |
-| `cache.h/c` | TTL 动态缓存 | `platform.h`, `debug.h` | ⭐⭐⭐ |
-| `relay.h/c` | 中继转发 + ID 映射 | `dns.h`, `debug.h` | ⭐⭐⭐ |
+| `platform.h/c` | Socket 初始化/清理/关闭 | 无 | ⭐⭐⭐ |
+| `debug.h/c` | 分级调试输出宏 + 递增序号 + 十六进制转储 | 无 | ⭐⭐⭐ |
+| `util.h/c` | 域名编解码/IP 地址转换工具 | `platform.h` | ⭐⭐⭐ |
+| `dns_message.h/c` | DNS 报文编解码 (Header + Question) | `platform.h` | ⭐⭐⭐ |
+| `dns_table.h/c` | 域名-IP 哈希表 (含动态添加) | `platform.h` | ⭐⭐⭐ |
+| `dns_cache.h/c` | TTL 动态缓存 (存完整响应报文) | `platform.h`, `debug.h` | ⭐⭐⭐ |
+| `id_map.h/c` | ID 转换表 (独立管理并发查询 ID 映射) | `platform.h`, `debug.h` | ⭐⭐⭐ |
+| `dns_relay.h/c` | 中继转发 (转发到外部 DNS) | `dns_message.h`, `id_map.h` | ⭐⭐⭐ |
 | `main.c` | 入口、select 事件循环、业务流程 | 所有模块 | ⭐ |
 
 ---
@@ -139,7 +139,11 @@ dnsrelay/
 
 ```bash
 # 编译
-gcc -Wall -Wextra -std=c99 -O2 -I src -o dnsrelay.exe src/main.c src/dns.c src/table.c src/relay.c src/cache.c -lws2_32
+gcc -Wall -Wextra -std=c99 -O2 -I src -o dnsrelay.exe \
+    src/main.c src/platform.c src/debug.c src/util.c \
+    src/dns_message.c src/dns_table.c src/dns_cache.c \
+    src/id_map.c src/dns_relay.c \
+    -lws2_32
 
 # 或使用 Makefile
 make
@@ -148,7 +152,7 @@ make
 ### 使用 MSVC (Visual Studio)
 
 ```
-cl /Wall /std:c11 /O2 /I src src/main.c src/dns.c src/table.c src/relay.c src/cache.c /link ws2_32.lib
+cl /Wall /std:c11 /O2 /I src src/main.c src/platform.c src/debug.c src/util.c src/dns_message.c src/dns_table.c src/dns_cache.c src/id_map.c src/dns_relay.c /link ws2_32.lib
 ```
 
 ### 使用 Makefile（推荐）

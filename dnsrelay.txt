@@ -909,3 +909,5 @@
 74.125.207.132 2.bp.blogspot.com
 74.125.207.132 3.bp.blogspot.com
 74.125.207.132 4.bp.blogspot.com
+123.127.134.10 www.bupt.cn
+202.108.33.89 www.bupt.cn

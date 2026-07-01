@@ -1,0 +1,9 @@
+Non-authoritative answer:
+Server:  UnKnown
+Address:  127.0.0.1
+
+Name:    www.a.shifen.com
+Addresses:  220.181.111.1
+	  220.181.111.232
+Aliases:  www.baidu.com
+
