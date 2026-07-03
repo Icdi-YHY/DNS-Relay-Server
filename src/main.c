@@ -60,6 +60,9 @@ int main(int argc, char *argv[]) {
     SetConsoleOutputCP(CP_UTF8);
 #endif
 
+    /* 设置 stderr 无缓冲，每行立即输出 */
+    setvbuf(stderr, NULL, _IONBF, 0);
+
     /* 1. 初始化 socket 库 */
     if (socket_init() != 0) {
         fprintf(stderr, "Socket 初始化失败\n");
@@ -317,8 +320,10 @@ static void handle_client_query(GlobalState *state,
     DEBUG(1, "查询: %-30s 类型=%3u  客户端=%-15s", q.qname, q.qtype, client_ip);
 
     /* 1. 检查缓存（动态缓存的中继结果，存完整响应报文） */
+    DEBUG(2, "缓存查询: %s", q.qname);
     CacheEntry *ce = dns_cache_get(&state->cache, q.qname);
     if (ce) {
+        DEBUG(2, "缓存命中: %s", q.qname);
         /* 缓存命中，复制响应并更新 ID 以匹配当前查询 */
         uint8_t cached_resp[MAX_DNS_PACKET];
         int copy_len = ce->response_len < (int)sizeof(cached_resp)
@@ -331,31 +336,87 @@ static void handle_client_query(GlobalState *state,
         return;
     }
 
-    /* 2. 检查本地对照表（支持一域名多 IP） */
-    uint32_t ips[16];
-    int ip_count = dns_table_lookup_all(&state->table, q.qname, ips, 16);
-    if (ip_count == -1) {
-        /* 不良网站拦截 (0.0.0.0 → NXDOMAIN) */
-        int resp_len = dns_build_response_multi(&hdr, &q, NULL, 0, 1, response);
-        if (resp_len > 0) {
-            sendto(state->sock, (const char *)response, resp_len, 0,
-                   (const struct sockaddr *)client_addr, sizeof(*client_addr));
-            DEBUG(1, "→ 拦截 (NXDOMAIN): %s", q.qname);
+    /* 2. 检查本地对照表（支持多类型 + 一域名多 IP） */
+    {
+        int table_type;
+        uint32_t table_ip;
+        char table_data[256];
+        int found = dns_table_lookup_type(&state->table, q.qname,
+                                          &table_type, &table_ip,
+                                          table_data, sizeof(table_data));
+
+        if (found && table_type == 1 && table_ip == 0) {
+            /* 不良网站拦截 (0.0.0.0 → NXDOMAIN) */
+            int resp_len = dns_build_response_multi(&hdr, &q, 1, NULL, 0, NULL, 1, response, NULL, 0);
+            if (resp_len > 0) {
+                sendto(state->sock, (const char *)response, resp_len, 0,
+                       (const struct sockaddr *)client_addr, sizeof(*client_addr));
+                DEBUG(1, "→ 拦截 (NXDOMAIN): %s", q.qname);
+            }
+            return;
         }
-        return;
-    }
-    if (ip_count > 0) {
-        /* 本地解析（可能多个 IP） */
-        int resp_len = dns_build_response_multi(&hdr, &q, ips, ip_count, 0, response);
-        if (resp_len > 0) {
-            sendto(state->sock, (const char *)response, resp_len, 0,
-                   (const struct sockaddr *)client_addr, sizeof(*client_addr));
-            char ip_str[64];
-            ip_int_to_str(ips[0], ip_str);
-            DEBUG(1, "→ 本地解析: %s -> %s (共%d个IP)",
-                  q.qname, ip_str, ip_count);
+
+        if (found && table_type == 1) {
+            /* A 记录：查全部 IP */
+            uint32_t ips[16];
+            int ip_count = dns_table_lookup_all(&state->table, q.qname, ips, 16);
+            if (ip_count > 0) {
+                int resp_len = dns_build_response_multi(&hdr, &q, 1, ips, ip_count, NULL, 0, response, NULL, 0);
+                if (resp_len > 0) {
+                    sendto(state->sock, (const char *)response, resp_len, 0,
+                           (const struct sockaddr *)client_addr, sizeof(*client_addr));
+                    char ip_str[64];
+                    DEBUG(1, "→ 本地解析: %s -> %s (共%d个IP, 类型=A)",
+                          q.qname, ip_int_to_str(ips[0], ip_str), ip_count);
+                }
+                return;
+            }
         }
-        return;
+
+        if (found && table_type != 1) {
+            /* 非 A 记录（AAAA / CNAME / MX / NS / PTR） */
+            static const char *type_names[29] = {NULL};
+            if (!type_names[1]) {
+                type_names[1] = "A"; type_names[2] = "NS"; type_names[5] = "CNAME";
+                type_names[12] = "PTR"; type_names[15] = "MX"; type_names[28] = "AAAA";
+            }
+            const char *tname = (table_type >= 1 && table_type <= 28)
+                                ? type_names[table_type] : "?";
+            if (!tname) tname = "?";
+
+            /* CNAME 额外返回目标域名的 A 记录 */
+            uint32_t extra_ips[16];
+            int extra_ip_count = 0;
+            if (table_type == 5) {
+                extra_ip_count = dns_table_lookup_all(&state->table,
+                                    table_data, extra_ips, 16);
+                if (extra_ip_count < 0) extra_ip_count = 0;
+            }
+            /* 类型不匹配时返回空应答（不报错，但无记录） */
+            int type_matches = (q.qtype == (uint16_t)table_type) ||
+                               (table_type == 5 && q.qtype == 1);
+            int resp_len;
+            if (!type_matches && table_type != 5) {
+                resp_len = dns_build_response_multi(&hdr, &q, table_type, NULL, 0,
+                                                     NULL, 0, response, NULL, 0);
+            } else {
+                resp_len = dns_build_response_multi(&hdr, &q, table_type, NULL, 0,
+                                                     table_data, 0, response,
+                                                     extra_ips, extra_ip_count);
+            }
+            if (resp_len > 0) {
+                sendto(state->sock, (const char *)response, resp_len, 0,
+                       (const struct sockaddr *)client_addr, sizeof(*client_addr));
+                if (table_type == 5 && extra_ip_count > 0) {
+                    DEBUG(1, "→ 本地解析: %s -> %s (类型=%s, 附带%d个IP)",
+                          q.qname, table_data, tname, extra_ip_count);
+                } else {
+                    DEBUG(1, "→ 本地解析: %s -> %s (类型=%s)",
+                          q.qname, table_data, tname);
+                }
+            }
+            return;
+        }
     }
 
     /* 3. 未命中 → 中继到上游 DNS */
@@ -417,6 +478,10 @@ static void handle_upstream_response(GlobalState *state,
             if (DNS_GET_RCODE(hdr) == DNS_RCODE_NOERROR) {
                 dns_cache_put(&state->cache, tmp_q.qname,
                               relay_resp, copy_len, 60);
+                DEBUG(1, "→ 已缓存: %s", tmp_q.qname);
+            } else {
+                DEBUG(1, "→ 未缓存(RCODE=%u): %s",
+                      DNS_GET_RCODE(hdr), tmp_q.qname);
             }
         }
     }

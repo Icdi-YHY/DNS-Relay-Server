@@ -53,18 +53,25 @@ typedef struct {
 #define DNS_RCODE_NXDOMAIN  3
 #define DNS_RCODE_REFUSED   5
 
-#define DNS_GET_QR(h)       (((h)->flags & DNS_QR_MASK) >> 15)
-#define DNS_GET_OPCODE(h)   (((h)->flags & DNS_OPCODE_MASK) >> 11)
-#define DNS_GET_RD(h)       (((h)->flags & DNS_RD_MASK) >> 8)
-#define DNS_GET_RCODE(h)    ((h)->flags & DNS_RCODE_MASK)
+#define DNS_GET_FLAGS(h)    ntohs((h)->flags)
+#define DNS_GET_QR(h)       ((DNS_GET_FLAGS(h) & DNS_QR_MASK) >> 15)
+#define DNS_GET_OPCODE(h)   ((DNS_GET_FLAGS(h) & DNS_OPCODE_MASK) >> 11)
+#define DNS_GET_RD(h)       ((DNS_GET_FLAGS(h) & DNS_RD_MASK) >> 8)
+#define DNS_GET_RCODE(h)    (DNS_GET_FLAGS(h) & DNS_RCODE_MASK)
 #define DNS_SET_RD(h, v)    do { \
-    (h)->flags = ((h)->flags & ~DNS_RD_MASK) | ((v) ? DNS_RD_MASK : 0); \
+    uint16_t _f = ntohs((h)->flags); \
+    _f = (_f & ~DNS_RD_MASK) | ((v) ? DNS_RD_MASK : 0); \
+    (h)->flags = htons(_f); \
 } while (0)
 #define DNS_SET_RA(h, v)    do { \
-    (h)->flags = ((h)->flags & ~DNS_RA_MASK) | ((v) ? DNS_RA_MASK : 0); \
+    uint16_t _f = ntohs((h)->flags); \
+    _f = (_f & ~DNS_RA_MASK) | ((v) ? DNS_RA_MASK : 0); \
+    (h)->flags = htons(_f); \
 } while (0)
 #define DNS_SET_RCODE(h, v) do { \
-    (h)->flags = ((h)->flags & ~DNS_RCODE_MASK) | ((v) & DNS_RCODE_MASK); \
+    uint16_t _f = ntohs((h)->flags); \
+    _f = (_f & ~DNS_RCODE_MASK) | ((v) & DNS_RCODE_MASK); \
+    (h)->flags = htons(_f); \
 } while (0)
 
 /* ========== QTYPE / QCLASS 常量 ========== */
@@ -152,8 +159,10 @@ int dns_build_response(const DNSHeader *req_hdr, const DNSQuestion *q,
  * 一个域名对应多个 IP 时使用此函数，Answer 段写入多条 A 记录
  */
 int dns_build_response_multi(const DNSHeader *req_hdr, const DNSQuestion *q,
-                              const uint32_t *ips, int ip_count,
-                              int nxdomain, uint8_t *out);
+                              int rr_type, const uint32_t *ips, int ip_count,
+                              const char *rdata_str,
+                              int nxdomain, uint8_t *out,
+                              const uint32_t *extra_ips, int extra_ip_count);
 
 /**
  * dns_build_relay_query - 构造转发给外部 DNS 的查询报文

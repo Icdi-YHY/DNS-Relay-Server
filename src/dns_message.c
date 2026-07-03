@@ -190,11 +190,17 @@ int dns_build_response(const DNSHeader *req_hdr, const DNSQuestion *q,
 }
 
 int dns_build_response_multi(const DNSHeader *req_hdr, const DNSQuestion *q,
-                              const uint32_t *ips, int ip_count,
-                              int nxdomain, uint8_t *out) {
+                              int rr_type, const uint32_t *ips, int ip_count,
+                              const char *rdata_str,
+                              int nxdomain, uint8_t *out,
+                              const uint32_t *extra_ips, int extra_ip_count) {
     if (!req_hdr || !q || !out) return -1;
-    if (nxdomain) ip_count = 0;
-    if (ip_count < 0) ip_count = 0;
+
+    int ancount = 0;
+    if (!nxdomain) {
+        if (rr_type == 1) ancount = ip_count > 0 ? ip_count : 0;
+        else ancount = (rdata_str && rdata_str[0]) ? 1 : 0;
+    }
 
     DNSHeader *r_hdr = (DNSHeader *)out;
     size_t pos = 0;
@@ -207,7 +213,7 @@ int dns_build_response_multi(const DNSHeader *req_hdr, const DNSQuestion *q,
                            (ntohs(req_hdr->flags) & DNS_RD_MASK) |
                            (nxdomain ? DNS_RCODE_NXDOMAIN : DNS_RCODE_NOERROR));
     r_hdr->qdcount = htons(1);
-    r_hdr->ancount = htons((uint16_t)ip_count);
+    r_hdr->ancount = htons((uint16_t)ancount);
     r_hdr->nscount = 0;
     r_hdr->arcount = 0;
     pos += sizeof(DNSHeader);
@@ -223,31 +229,97 @@ int dns_build_response_multi(const DNSHeader *req_hdr, const DNSQuestion *q,
     pos += 2;
 
     /* 3. NXDOMAIN 则无 Answer 段 */
-    if (nxdomain || ip_count == 0)
+    if (nxdomain || ancount == 0)
         return (int)pos;
 
-    /* 4. 写多条 A 记录 */
+    /* 4. 写 Answer 段 */
     uint16_t name_ptr = htons(0xC000 | sizeof(DNSHeader));
 
-    for (int i = 0; i < ip_count; i++) {
-        if (pos + 2 + sizeof(DNSResourceRecord) + 4 > 512) break;
+    if (rr_type == 1) {
+        /* A 记录：多条 IPv4 地址 */
+        for (int i = 0; i < ip_count; i++) {
+            if (pos + 2 + sizeof(DNSResourceRecord) + 4 > 512) break;
+            memcpy(out + pos, &name_ptr, 2); pos += 2;
+            DNSResourceRecord rr;
+            rr.type     = htons(DNS_TYPE_A);
+            rr.cls      = htons(DNS_CLASS_IN);
+            rr.ttl      = htonl(3600);
+            rr.rdlength = htons(4);
+            memcpy(out + pos, &rr, sizeof(DNSResourceRecord)); pos += sizeof(DNSResourceRecord);
+            memcpy(out + pos, &ips[i], 4); pos += 4;
+        }
+    } else if (rr_type == 28 && rdata_str) {
+        /* AAAA 记录：16 字节 IPv6 地址 */
+        struct in6_addr addr6;
+        if (inet_pton(AF_INET6, rdata_str, &addr6) == 1) {
+            if (pos + 2 + sizeof(DNSResourceRecord) + 16 > 512) return (int)pos;
+            memcpy(out + pos, &name_ptr, 2); pos += 2;
+            DNSResourceRecord rr;
+            rr.type     = htons(DNS_TYPE_AAAA);
+            rr.cls      = htons(DNS_CLASS_IN);
+            rr.ttl      = htonl(3600);
+            rr.rdlength = htons(16);
+            memcpy(out + pos, &rr, sizeof(DNSResourceRecord)); pos += sizeof(DNSResourceRecord);
+            memcpy(out + pos, &addr6, 16); pos += 16;
+        }
+    } else if ((rr_type == 5 || rr_type == 2 || rr_type == 12) && rdata_str) {
+        /* CNAME / NS / PTR 记录：目标域名 */
+        uint8_t target_enc[256];
+        int target_len = dns_encode_name(target_enc, rdata_str);
+        if (target_len > 0) {
+            /* 记下 CNAME RDATA 的起始位置（供后面的 A 记录压缩指针使用） */
+            uint16_t cname_rdata_pos = (uint16_t)(pos + 2 + sizeof(DNSResourceRecord));
 
-        /* 名称压缩指针 */
-        memcpy(out + pos, &name_ptr, 2);
-        pos += 2;
+            if (pos + 2 + sizeof(DNSResourceRecord) + (size_t)target_len > 512) return (int)pos;
+            memcpy(out + pos, &name_ptr, 2); pos += 2;
+            DNSResourceRecord rr;
+            rr.type     = htons((uint16_t)rr_type);
+            rr.cls      = htons(DNS_CLASS_IN);
+            rr.ttl      = htonl(3600);
+            rr.rdlength = htons((uint16_t)target_len);
+            memcpy(out + pos, &rr, sizeof(DNSResourceRecord)); pos += sizeof(DNSResourceRecord);
+            memcpy(out + pos, target_enc, (size_t)target_len); pos += (size_t)target_len;
 
-        /* RR */
-        DNSResourceRecord rr;
-        rr.type     = htons(DNS_TYPE_A);
-        rr.cls      = htons(DNS_CLASS_IN);
-        rr.ttl      = htonl(3600);
-        rr.rdlength = htons(4);
-        memcpy(out + pos, &rr, sizeof(DNSResourceRecord));
-        pos += sizeof(DNSResourceRecord);
+            /* CNAME 同时返回目标域名的 A 记录 */
+            if (rr_type == 5 && extra_ips && extra_ip_count > 0) {
+                for (int ei = 0; ei < extra_ip_count; ei++) {
+                    if (pos + 2 + sizeof(DNSResourceRecord) + 4 > 512) break;
+                    /* 名称压缩指针指向 CNAME RDATA 中的目标域名 */
+                    uint16_t canon_ptr = htons(0xC000 | cname_rdata_pos);
+                    memcpy(out + pos, &canon_ptr, 2); pos += 2;
+                    DNSResourceRecord arr;
+                    arr.type     = htons(DNS_TYPE_A);
+                    arr.cls      = htons(DNS_CLASS_IN);
+                    arr.ttl      = htonl(3600);
+                    arr.rdlength = htons(4);
+                    memcpy(out + pos, &arr, sizeof(DNSResourceRecord)); pos += sizeof(DNSResourceRecord);
+                    memcpy(out + pos, &extra_ips[ei], 4); pos += 4;
+                    ancount++;
+                }
+                /* 更新 ANCOUNT */
+                r_hdr->ancount = htons((uint16_t)ancount);
+            }
+        }
+    } else if (rr_type == 15 && rdata_str) {
+        /* MX 记录：2 字节优先级 + 目标域名 */
+        char mx_domain[256];
+        strncpy(mx_domain, rdata_str, sizeof(mx_domain) - 1);
+        mx_domain[sizeof(mx_domain) - 1] = '\0';
 
-        /* RDATA */
-        memcpy(out + pos, &ips[i], 4);
-        pos += 4;
+        uint8_t target_enc[256];
+        int target_len = dns_encode_name(target_enc, mx_domain);
+        if (target_len > 0) {
+            if (pos + 2 + sizeof(DNSResourceRecord) + 2 + (size_t)target_len > 512) return (int)pos;
+            memcpy(out + pos, &name_ptr, 2); pos += 2;
+            DNSResourceRecord rr;
+            rr.type     = htons(DNS_TYPE_MX);
+            rr.cls      = htons(DNS_CLASS_IN);
+            rr.ttl      = htonl(3600);
+            rr.rdlength = htons((uint16_t)(2 + target_len));
+            memcpy(out + pos, &rr, sizeof(DNSResourceRecord)); pos += sizeof(DNSResourceRecord);
+            *(uint16_t *)(out + pos) = htons(10); pos += 2;  /* preference = 10 */
+            memcpy(out + pos, target_enc, (size_t)target_len); pos += (size_t)target_len;
+        }
     }
 
     return (int)pos;

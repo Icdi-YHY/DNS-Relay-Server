@@ -911,3 +911,7 @@
 74.125.207.132 4.bp.blogspot.com
 123.127.134.10 www.bupt.cn
 202.108.33.89 www.bupt.cn
+AAAA 2001:da8:215::1 ipv6.bupt.cn
+CNAME www.bupt.cn alias.bupt.cn
+MX mail.bupt.cn mx.bupt.cn
+NS ns1.bupt.cn myns.bupt.cn

@@ -14,7 +14,9 @@
 /* 一条对照表记录 */
 typedef struct TableEntry {
     char   domain[256];       /* 域名 */
-    uint32_t ip;              /* IP 地址（网络字节序），0.0.0.0 表示拦截 */
+    int    type;              /* DNS 记录类型 (A=1, AAAA=28, CNAME=5, MX=15, NS=2, PTR=12) */
+    uint32_t ip;              /* A 记录的 IP 地址（网络字节序），0.0.0.0 表示拦截 */
+    char   data[256];         /* CNAME/MX/NS/PTR 的目标值 */
     struct TableEntry *next;  /* 链表指针（链地址法解决哈希冲突） */
 } TableEntry;
 
@@ -71,6 +73,20 @@ int dns_table_lookup(DNSTable *t, const char *domain, uint32_t *ip);
  * 返回 0 表示未命中；返回 -1 表示命中但含 0.0.0.0（拦截）
  */
 int dns_table_lookup_all(DNSTable *t, const char *domain, uint32_t *ips, int max_ips);
+
+/**
+ * dns_table_lookup_type - 查询域名的记录类型和目标值
+ * @t: 对照表指针
+ * @domain: 域名
+ * @type: 输出参数，记录类型
+ * @ip: 输出参数，A 记录的 IP（网络字节序）
+ * @data: 输出参数，CNAME/MX/NS/PTR 的目标值
+ * @data_len: data 缓冲区大小
+ * @return: 0=未命中, 1=命中
+ */
+int dns_table_lookup_type(DNSTable *t, const char *domain,
+                          int *type, uint32_t *ip,
+                          char *data, int data_len);
 
 /**
  * dns_table_add - 添加条目（用于缓存更新）
