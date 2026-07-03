@@ -26,6 +26,7 @@
 #define DEFAULT_CACHE_SIZE  1021   /* 缓存哈希桶数 */
 #define DEFAULT_ID_MAP_SIZE 1024   /* 最大并发查询数 */
 #define PENDING_TIMEOUT     5      /* 超时秒数 */
+#define DEFAULT_CACHE_TTL   60     /* 默认缓存 TTL（秒） */
 
 /* ========== 全局配置 ========== */
 typedef struct {
@@ -39,6 +40,7 @@ typedef struct {
     DNSTable    table;               /* 静态对照表 */
     DNSCache    cache;               /* 动态缓存 */
     IDMap       id_map;              /* ID 映射表 */
+    int         cache_ttl;           /* 缓存 TTL（秒），0=使用上游值 */
 } GlobalState;
 
 /* ========== 函数声明 ========== */
@@ -72,8 +74,9 @@ int main(int argc, char *argv[]) {
     /* 2. 解析命令行参数 */
     memset(&state, 0, sizeof(state));
     state.dns_port = DNS_PORT;
+    state.cache_ttl = 0;  /* 0 = 使用上游 DNS 的 TTL */
     if (parse_args(&state, argc, argv) != 0) {
-        fprintf(stderr, "用法: dnsrelay [-d|-dd] [dns-server-ipaddr] [filename]\n");
+        fprintf(stderr, "用法: dnsrelay [-d|-dd] [-ttl N] [dns-server-ipaddr] [filename]\n");
         socket_cleanup();
         return 1;
     }
@@ -211,6 +214,10 @@ static int parse_args(GlobalState *state, int argc, char *argv[]) {
         } else if (strcmp(argv[i], "-dd") == 0) {
             g_debug_level = DEBUG_LEVEL_VERBOSE;
             i++;
+        } else if (strcmp(argv[i], "-ttl") == 0 && i + 1 < argc) {
+            int ttl = atoi(argv[++i]);
+            if (ttl > 0) state->cache_ttl = ttl;
+            i++;
         } else if (argv[i][0] == '-') {
             fprintf(stderr, "未知选项: %s\n", argv[i]);
             return -1;
@@ -320,17 +327,53 @@ static void handle_client_query(GlobalState *state,
     DEBUG(1, "查询: %-30s 类型=%3u  客户端=%-15s", q.qname, q.qtype, client_ip);
 
     /* 1. 检查缓存（动态缓存的中继结果，存完整响应报文） */
-    DEBUG(2, "缓存查询: %s", q.qname);
-    CacheEntry *ce = dns_cache_get(&state->cache, q.qname);
+    char cache_key[300];
+    snprintf(cache_key, sizeof(cache_key), "%s|%u", q.qname, q.qtype);
+    DEBUG(2, "缓存查询: %s (类型=%u)", q.qname, q.qtype);
+    CacheEntry *ce = dns_cache_get(&state->cache, cache_key);
     if (ce) {
-        DEBUG(2, "缓存命中: %s", q.qname);
-        /* 缓存命中，复制响应并更新 ID 以匹配当前查询 */
+        DEBUG(2, "缓存命中: %s (类型=%u)", q.qname, q.qtype);
+        /* 缓存命中，用当前查询的问题段 + 缓存的 Answer 段构造响应 */
+        /* 避免问题段编码不一致导致客户端报 Question section mismatch */
         uint8_t cached_resp[MAX_DNS_PACKET];
-        int copy_len = ce->response_len < (int)sizeof(cached_resp)
-                       ? ce->response_len : (int)sizeof(cached_resp);
-        memcpy(cached_resp, ce->response, (size_t)copy_len);
-        dns_restore_id(cached_resp, (size_t)copy_len, ntohs(hdr.id));
-        sendto(state->sock, (const char *)cached_resp, copy_len, 0,
+        /* 复制头部 */
+        memcpy(cached_resp, ce->response, sizeof(DNSHeader));
+        DNSHeader *chdr = (DNSHeader *)cached_resp;
+        chdr->id = hdr.id;  /* 匹配当前查询 */
+        size_t cpos = sizeof(DNSHeader);
+
+        /* 重新写 Question 段（用当前查询的域名） */
+        int qname_len = dns_encode_name(cached_resp + cpos, q.qname);
+        if (qname_len > 0) {
+            cpos += qname_len;
+            *(uint16_t *)(cached_resp + cpos) = htons(q.qtype);
+            cpos += 2;
+            *(uint16_t *)(cached_resp + cpos) = htons(q.qclass);
+            cpos += 2;
+        }
+
+        /* 复制缓存的 Answer 段 */
+        /* 跳过原响应中的 Question 段，定位到 Answer */
+        const DNSHeader *ce_hdr = (const DNSHeader *)ce->response;
+        uint16_t ce_qdcount = ntohs(ce_hdr->qdcount);
+        const uint8_t *ce_body = ce->response + sizeof(DNSHeader);
+        int ce_body_len = ce->response_len - (int)sizeof(DNSHeader);
+        /* 跳过原 Question 段 */
+        const uint8_t *ce_p = ce_body;
+        const uint8_t *ce_end = ce_body + ce_body_len;
+        for (uint16_t i = 0; i < ce_qdcount && ce_p < ce_end; i++) {
+            ce_p = dns_skip_name(ce_p, ce_end);
+            if (!ce_p) break;
+            ce_p += 4;  /* QTYPE + QCLASS */
+        }
+        /* ce_p 现在指向 Answer 段开头 */
+        int answer_len = (int)(ce_end - ce_p);
+        if (answer_len > 0 && (int)(cpos + answer_len) < MAX_DNS_PACKET) {
+            memcpy(cached_resp + cpos, ce_p, answer_len);
+        }
+
+        int total_len = (int)(cpos + (answer_len > 0 ? answer_len : 0));
+        sendto(state->sock, (const char *)cached_resp, total_len, 0,
                (const struct sockaddr *)client_addr, sizeof(*client_addr));
         DEBUG(1, "→ 缓存命中: %s", q.qname);
         return;
@@ -476,9 +519,17 @@ static void handle_upstream_response(GlobalState *state,
 
             /* 缓存响应报文供后续使用 */
             if (DNS_GET_RCODE(hdr) == DNS_RCODE_NOERROR) {
-                dns_cache_put(&state->cache, tmp_q.qname,
-                              relay_resp, copy_len, 60);
-                DEBUG(1, "→ 已缓存: %s", tmp_q.qname);
+                int cache_ttl = state->cache_ttl;
+                if (cache_ttl <= 0) {
+                    /* 未指定 TTL，从上游响应提取（所有类型） */
+                    cache_ttl = dns_extract_ttl(resp, (size_t)resp_len);
+                    if (cache_ttl <= 0) cache_ttl = 60;
+                }
+                char ck[300];
+                snprintf(ck, sizeof(ck), "%s|%u", tmp_q.qname, tmp_q.qtype);
+                dns_cache_put(&state->cache, ck,
+                              relay_resp, copy_len, cache_ttl);
+                DEBUG(1, "→ 已缓存: %s (类型=%u, TTL=%us)", tmp_q.qname, tmp_q.qtype, cache_ttl);
             } else {
                 DEBUG(1, "→ 未缓存(RCODE=%u): %s",
                       DNS_GET_RCODE(hdr), tmp_q.qname);

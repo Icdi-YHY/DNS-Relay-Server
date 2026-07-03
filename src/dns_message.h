@@ -119,6 +119,14 @@ int dns_decode_query(const uint8_t *raw, int len,
 int dns_encode_name(uint8_t *buf, const char *name);
 
 /**
+ * dns_skip_name - 跳过 DNS 报文中的一个域名（不解码）
+ * @p: 当前指针位置
+ * @end: 报文结束位置
+ * @return: 跳过后的位置，失败返回 NULL
+ */
+const uint8_t *dns_skip_name(const uint8_t *p, const uint8_t *end);
+
+/**
  * dns_decode_name - 解码 DNS 域名（支持压缩指针）
  * @raw: DNS 报文起始位置
  * @rawlen: 报文总长度
@@ -198,6 +206,16 @@ int dns_restore_id(uint8_t *response, size_t response_len,
 int dns_extract_a_record(const uint8_t *response, size_t resp_len,
                          char *domain, size_t domain_len,
                          uint32_t *ip_addr, uint32_t *ttl);
+
+/**
+ * dns_extract_ttl - 从 DNS 响应中提取第一条 Answer 的 TTL
+ * @response: DNS 响应报文
+ * @resp_len: 响应报文长度
+ * @return: TTL 值（秒），失败返回 -1
+ *
+ * 不关心记录类型，任何类型的 Answer 都提取 TTL
+ */
+int dns_extract_ttl(const uint8_t *response, size_t resp_len);
 
 #ifdef _MSC_VER
     #pragma pack(pop)

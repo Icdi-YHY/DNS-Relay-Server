@@ -10,7 +10,7 @@
 /* ========== 内部工具函数 ========== */
 
 /* 跳过报文中的一个域名（不解码），返回跳过后的位置 */
-static const uint8_t *skip_name(const uint8_t *p, const uint8_t *end) {
+const uint8_t *dns_skip_name(const uint8_t *p, const uint8_t *end) {
     if (!p || !end || p >= end) return NULL;
 
     while (*p != 0) {
@@ -390,7 +390,7 @@ int dns_extract_a_record(const uint8_t *response, size_t resp_len,
 
     /* 跳过 Question 段 */
     for (uint16_t i = 0; i < qdcount; i++) {
-        p = skip_name(p, end);
+        p = dns_skip_name(p, end);
         if (!p || p + 4 > end) return -1;
         p += 4;
     }
@@ -399,7 +399,7 @@ int dns_extract_a_record(const uint8_t *response, size_t resp_len,
     if (p >= end) return -1;
 
     const uint8_t *name_start = p;
-    p = skip_name(p, end);
+    p = dns_skip_name(p, end);
     if (!p || p + sizeof(DNSResourceRecord) > end) return -1;
 
     /* 提取域名 */
@@ -423,4 +423,34 @@ int dns_extract_a_record(const uint8_t *response, size_t resp_len,
     if (ip_addr) *ip_addr = *(const uint32_t *)p;
 
     return 1;
+}
+
+int dns_extract_ttl(const uint8_t *response, size_t resp_len) {
+    if (!response || resp_len < sizeof(DNSHeader)) return -1;
+
+    const DNSHeader *hdr = (const DNSHeader *)response;
+    if (DNS_GET_QR(hdr) != 1) return -1;  /* 必须是响应 */
+    if (DNS_GET_RCODE(hdr) != DNS_RCODE_NOERROR) return -1;
+
+    uint16_t qdcount = ntohs(hdr->qdcount);
+    uint16_t ancount = ntohs(hdr->ancount);
+    if (qdcount == 0 || ancount == 0) return -1;
+
+    const uint8_t *p = response + sizeof(DNSHeader);
+    const uint8_t *end = response + resp_len;
+
+    /* 跳过 Question 段 */
+    for (uint16_t i = 0; i < qdcount; i++) {
+        p = dns_skip_name(p, end);
+        if (!p || p + 4 > end) return -1;
+        p += 4;
+    }
+
+    /* 跳过第一个 Answer 的 NAME */
+    p = dns_skip_name(p, end);
+    if (!p || p + sizeof(DNSResourceRecord) > end) return -1;
+
+    /* 读取 TTL */
+    const DNSResourceRecord *rr = (const DNSResourceRecord *)p;
+    return (int)ntohl(rr->ttl);
 }

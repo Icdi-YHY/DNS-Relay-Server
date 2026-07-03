@@ -34,8 +34,8 @@ int dns_cache_put(DNSCache *c, const char *domain,
                   const uint8_t *response, int len, int ttl) {
     if (!c || !domain || !response || len <= 0) return -1;
 
-    /* TTL 最小为 60 秒，避免频繁查询 */
-    if (ttl < 60) ttl = 60;
+    /* 允许 TTL 为 0（不缓存），否则按用户设置 */
+    if (ttl < 0) ttl = 0;
 
     time_t expire = time(NULL) + ttl;
     unsigned long idx = cache_hash(domain) % (unsigned long)c->size;
