@@ -917,3 +917,4 @@ MX mail.bupt.cn mx.bupt.cn
 NS ns1.bupt.cn myns.bupt.cn
 PTR www.bupt.cn 4.3.2.1.in-addr.arpa
 NS ns1.bupt.cn myns.bupt.cnCNAME www.bupt.cn alias.bupt.cn
+PTR localhost 1.0.0.127.in-addr.arpa
